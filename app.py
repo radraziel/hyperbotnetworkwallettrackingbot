@@ -1,12 +1,13 @@
 # app.py
 # ------------------------------------------------------------
-# Hyperbot Network Wallet Tracking Bot (mejorado)
-# - /start, /walletsus, /status, /stop, /checknow
+# Hyperbot Network Wallet Tracking Bot (Py 3.13 ready)
+# - /start, /walletsus, /status, /checknow, /stop
 # - Monitoreo de hyperbot.network con extracción en cascada:
-#   1) __NEXT_DATA__ (Next.js)
-#   2) Descubrimiento de endpoints en <script>/HTML (JSON/CSV)
-#   3) Fallback heurístico de texto + (opcional) alerta por cambio de página
-# - Servidor HTTP (FastAPI) para health checks en Render Web Service
+#   1) __NEXT_DATA__
+#   2) Descubrimiento de endpoints JSON/CSV en <script>/HTML
+#   3) Fallback heurístico + alerta opcional de cambio de página
+# - Servidor HTTP (FastAPI) para health checks en Render
+# - Fix: crea/establece event loop explícito para Python 3.13
 # ------------------------------------------------------------
 
 import os
@@ -28,7 +29,6 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import uvicorn
 
-# --- Telegram (python-telegram-bot v21) ---
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
 from telegram.error import Conflict
@@ -53,8 +53,6 @@ if not BOT_TOKEN:
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; WalletWatchBot/1.0)")
 HYPERBOT_BASE = "https://hyperbot.network"
-
-# Si pones PAGE_CHANGE_ALERTS=true, avisa cuando cambie el hash del HTML
 PAGE_CHANGE_ALERTS = os.getenv("PAGE_CHANGE_ALERTS", "false").lower() in ("1", "true", "yes")
 
 REDIS_URL = os.getenv("REDIS_URL", "")
@@ -162,10 +160,11 @@ def _format_line(raw: str) -> str:
     return raw
 
 def _hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    import hashlib as _hh
+    return _hh.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 # =========================
-# Extractor de eventos desde hyperbot.network
+# Extractor
 # =========================
 class HyperbotExtractor:
     TRADER_PATH = "/trader/{addr}"
@@ -180,7 +179,6 @@ class HyperbotExtractor:
 
     @staticmethod
     def _parse_next_data(soup: BeautifulSoup) -> List[str]:
-        """Devuelve líneas de eventos desde __NEXT_DATA__, si existe."""
         out: List[str] = []
         tag = soup.find("script", id="__NEXT_DATA__")
         if not tag:
@@ -210,26 +208,14 @@ class HyperbotExtractor:
 
     @staticmethod
     def _discover_api_urls(addr: str, html_text: str) -> List[str]:
-        """
-        Busca URLs dentro del HTML/script que parezcan endpoints JSON/CSV asociados a la wallet.
-        Ejemplos: /api/.../0xABC..., https://...json, ?address=0x..
-        """
         addr_l = addr.lower()
         candidates: List[str] = []
-
-        # URLs absolutas o relativas
-        url_re = re.compile(r"""(?P<u>
-            https?://[^\s"'<>]+ |
-            /[A-Za-z0-9_\-\/\.\?\=&%]+
-        )""", re.VERBOSE)
-
+        url_re = re.compile(r"""(?P<u>https?://[^\s"'<>]+|/[A-Za-z0-9_\-\/\.\?\=&%]+)""")
         for m in url_re.finditer(html_text):
             u = m.group("u")
             if addr_l in u.lower():
                 if any(ext in u.lower() for ext in (".json", ".csv")) or ("/api/" in u.lower()):
                     candidates.append(u)
-
-        # Dedup preservando orden
         seen = set()
         uniq = []
         for u in candidates:
@@ -242,7 +228,6 @@ class HyperbotExtractor:
     def _abs_url(u: str) -> str:
         if u.startswith("http://") or u.startswith("https://"):
             return u
-        # relativa
         return HYPERBOT_BASE.rstrip("/") + "/" + u.lstrip("/")
 
     @staticmethod
@@ -252,7 +237,6 @@ class HyperbotExtractor:
             f = io.StringIO(text)
             reader = csv.DictReader(f)
             for row in reader:
-                # Intenta construir una línea legible
                 sym = row.get("Symbol") or row.get("symbol") or row.get("pair") or ""
                 act = row.get("Action") or row.get("action") or ""
                 size = row.get("Size") or row.get("size") or ""
@@ -266,12 +250,9 @@ class HyperbotExtractor:
 
     @staticmethod
     def _parse_json(obj: Any) -> List[str]:
-        """Intenta encontrar fills/orders/trades en JSON genérico."""
         out: List[str] = []
-
         def walk(node):
             if isinstance(node, dict):
-                # filas conocidas
                 keys = set(k.lower() for k in node.keys())
                 if {"symbol", "action", "size"} <= keys or {"pair", "side", "size"} <= keys:
                     sym = node.get("symbol") or node.get("pair") or ""
@@ -286,17 +267,11 @@ class HyperbotExtractor:
             elif isinstance(node, list):
                 for it in node:
                     walk(it)
-
         walk(obj)
         return out
 
     @classmethod
     async def fetch_events(cls, addr: str) -> Tuple[List[Tuple[str, str]], Dict[str, Any]]:
-        """
-        Devuelve (events, meta)
-        events: lista [(event_id, text)]
-        meta: {reason: str, page_hash: str, discovered_urls: [..]}
-        """
         addr = cls._normalize_addr(addr)
         url = cls._trader_url(addr)
         meta: Dict[str, Any] = {"reason": "", "page_hash": "", "discovered_urls": []}
@@ -340,7 +315,7 @@ class HyperbotExtractor:
                     except Exception as e:
                         logger.warning(f"Fallo al leer {absu}: {e}")
 
-        # 3) Fallback heurístico (texto visible) – puede ser ruidoso; lo dejamos al final
+        # 3) Fallback heurístico
         if not events_texts:
             keywords = ["perp", "trade", "order", "opened", "closed", "created", "filled", "recent", "position", "entry", "liq", "value"]
             texts: List[str] = []
@@ -350,7 +325,6 @@ class HyperbotExtractor:
                     continue
                 if any(k in t.lower() for k in keywords):
                     texts.append(t)
-            # Combinar y formatear
             buf = ""
             combined: List[str] = []
             for t in texts:
@@ -365,7 +339,6 @@ class HyperbotExtractor:
                 combined.append(buf)
             events_texts.extend(_format_line(x) for x in combined)
 
-        # Construye tuplas (id, texto)
         events: List[Tuple[str, str]] = []
         seen = set()
         for raw in events_texts:
@@ -375,15 +348,11 @@ class HyperbotExtractor:
             seen.add(eid)
             events.append((eid, raw))
 
-        if events:
-            meta["reason"] = "ok"
-        else:
-            meta["reason"] = "no_events_found"
-
+        meta["reason"] = "ok" if events else "no_events_found"
         return events[:100], meta
 
 # =========================
-# Formato & helpers de mensajes
+# Mensajes
 # =========================
 def format_alert(addr: str, event_text: str) -> str:
     link = f"{HYPERBOT_BASE}/trader/{addr.lower()}"
@@ -402,7 +371,7 @@ def format_help() -> str:
         "*Comandos:*\n"
         "• `/walletsus <direccion>` — Suscribirte (reemplaza la anterior)\n"
         "• `/status` — Wallet suscrita y último chequeo\n"
-        "• `/checknow` — Forzar snapshot inmediato (debug)\n"
+        "• `/checknow` — Forzar snapshot inmediato\n"
         "• `/stop` — Detener monitoreo\n\n"
         "_Ejemplo:_ `/walletsus 0xc2a30212a8ddac9e123944d6e29faddce994e5f2`"
     )
@@ -411,7 +380,7 @@ def _utc_now() -> str:
     return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 # =========================
-# Handlers de comandos
+# Handlers
 # =========================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Abrir Hyperbot", url="https://hyperbot.network")]])
@@ -451,16 +420,13 @@ async def subs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def checknow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fuerza un chequeo inmediato y muestra un resumen de lo encontrado."""
     chat_id = update.effective_chat.id
     wal = STORE.get_wallet(chat_id)
     if not wal:
         await update.message.reply_text("Primero suscríbete con `/walletsus <direccion>`.", parse_mode=ParseMode.MARKDOWN)
         return
-
     await update.message.reply_text("⏳ Checando ahora mismo en Hyperbot...", parse_mode=ParseMode.MARKDOWN)
     events, meta = await HyperbotExtractor.fetch_events(wal)
-
     if events:
         sample = "\n".join(f"• {txt}" for _, txt in events[:3])
         await update.message.reply_text(
@@ -485,7 +451,6 @@ async def monitor_loop(bot_app: Application):
     await asyncio.sleep(2)
     while True:
         try:
-            # Recolectar suscripciones
             chats_wallets: List[Tuple[int, str]] = []
             if USE_REDIS:
                 cursor = 0
@@ -504,12 +469,10 @@ async def monitor_loop(bot_app: Application):
                         chat_id = int(k.split(":")[1])
                         chats_wallets.append((chat_id, v))
 
-            # Nada que hacer
             if not chats_wallets:
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            # Procesar cada chat/wallet
             for chat_id, addr in chats_wallets:
                 try:
                     events, meta = await HyperbotExtractor.fetch_events(addr)
@@ -517,7 +480,6 @@ async def monitor_loop(bot_app: Application):
                     page_hash_prev = STORE.get_page_hash(chat_id, addr)
                     STORE.set_page_hash(chat_id, addr, meta.get("page_hash", ""))
 
-                    # Si no hay eventos pero cambió la página y está habilitado, avisar cambio
                     if not events and PAGE_CHANGE_ALERTS and page_hash_prev and page_hash_prev != meta.get("page_hash"):
                         try:
                             await bot_app.bot.send_message(
@@ -530,18 +492,15 @@ async def monitor_loop(bot_app: Application):
                         except Exception as e:
                             logger.warning(f"Send page-change failed chat {chat_id}: {e}")
 
-                    # Si hay eventos, decidir cuáles son nuevos
                     if events:
                         new_events: List[Tuple[str, str]] = []
                         if not last_id:
-                            # primera vez: no spamear histórico; solo marcar el más reciente como visto
                             STORE.set_last_event_id(chat_id, addr, events[0][0])
                         else:
                             for eid, txt in events:
                                 if eid == last_id:
                                     break
                                 new_events.append((eid, txt))
-
                             if new_events:
                                 for eid, txt in reversed(new_events):
                                     msg = format_alert(addr, txt)
@@ -565,7 +524,7 @@ async def monitor_loop(bot_app: Application):
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 # =========================
-# Servidor HTTP para Render
+# HTTP server
 # =========================
 app_http = FastAPI()
 
@@ -592,7 +551,7 @@ async def error_handler(update: object, context: CallbackContext) -> None:
     logger.exception(f"Excepción no manejada: {err}")
 
 # =========================
-# Preinicio: borrar webhook (por si acaso)
+# Preinicio: limpiar webhook
 # =========================
 async def pre_start_cleanup(app: Application):
     try:
@@ -602,11 +561,13 @@ async def pre_start_cleanup(app: Application):
         logger.warning(f"No se pudo eliminar webhook (puede no existir): {e}")
 
 # =========================
-# Main
+# Main (fix Py 3.13: event loop explícito)
 # =========================
 def main():
+    # Servidor HTTP en hilo aparte
     threading.Thread(target=run_http_server, daemon=True).start()
 
+    # Construir app de Telegram
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", start_cmd))
@@ -616,11 +577,21 @@ def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_error_handler(error_handler)
 
+    # Limpiar webhook antes de iniciar
     asyncio.run(pre_start_cleanup(app))
 
+    # Lanzar monitor en segundo plano
     threading.Thread(target=lambda: asyncio.run(monitor_loop(app)), daemon=True).start()
 
     logger.info("Bot iniciado (polling + HTTP healthcheck).")
+
+    # --------- FIX PARA PYTHON 3.13 ----------
+    # Crear y fijar un event loop explícito para el hilo principal
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    # -----------------------------------------
+
+    # Iniciar polling
     app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
