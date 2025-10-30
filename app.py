@@ -1,13 +1,10 @@
 # app.py
 # ------------------------------------------------------------
-# Hyperbot Network Wallet Tracking Bot (Py 3.13 ready)
+# Hyperbot Network Wallet Tracking Bot (Py 3.13 stable, async)
 # - /start, /walletsus, /status, /checknow, /stop
-# - Monitoreo de hyperbot.network con extracción en cascada:
-#   1) __NEXT_DATA__
-#   2) Descubrimiento de endpoints JSON/CSV en <script>/HTML
-#   3) Fallback heurístico + alerta opcional de cambio de página
-# - Servidor HTTP (FastAPI) para health checks en Render
-# - Fix: crea/establece event loop explícito para Python 3.13
+# - Extracción en cascada (NEXT_DATA -> URLs JSON/CSV descubiertas -> heurística)
+# - Healthcheck FastAPI para Render
+# - Arranque asíncrono: initialize/start/polling/idle con asyncio.run(...)
 # ------------------------------------------------------------
 
 import os
@@ -41,7 +38,7 @@ from telegram.ext import (
 )
 
 # =========================
-# Configuración general
+# Config
 # =========================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hyperbot-telegram")
@@ -61,7 +58,7 @@ if USE_REDIS:
     import redis  # opcional
 
 # =========================
-# Persistencia (Redis opcional)
+# Storage
 # =========================
 class Storage:
     def __init__(self):
@@ -86,10 +83,7 @@ class Storage:
 
     def get_wallet(self, chat_id: int) -> Optional[str]:
         key = self._k(chat_id, "wallet")
-        if self.r:
-            return self.r.get(key)
-        else:
-            return self.memory.get(key)
+        return self.r.get(key) if self.r else self.memory.get(key)
 
     def set_last_event_id(self, chat_id: int, wallet: str, event_id: str) -> None:
         key = self._k(chat_id, f"last_event:{wallet.lower()}")
@@ -100,10 +94,7 @@ class Storage:
 
     def get_last_event_id(self, chat_id: int, wallet: str) -> Optional[str]:
         key = self._k(chat_id, f"last_event:{wallet.lower()}")
-        if self.r:
-            return self.r.get(key)
-        else:
-            return self.last_event.get(key)
+        return self.r.get(key) if self.r else self.last_event.get(key)
 
     def set_last_check(self, chat_id: int) -> None:
         key = self._k(chat_id, "last_check_ts")
@@ -118,8 +109,7 @@ class Storage:
         if self.r:
             val = self.r.get(key)
             return float(val) if val else None
-        else:
-            return self.last_check.get(key)
+        return self.last_check.get(key)
 
     def set_page_hash(self, chat_id: int, wallet: str, h: str) -> None:
         key = self._k(chat_id, f"page_hash:{wallet.lower()}")
@@ -130,22 +120,19 @@ class Storage:
 
     def get_page_hash(self, chat_id: int, wallet: str) -> Optional[str]:
         key = self._k(chat_id, f"page_hash:{wallet.lower()}")
-        if self.r:
-            return self.r.get(key)
-        else:
-            return self.page_hash.get(key)
+        return self.r.get(key) if self.r else self.page_hash.get(key)
 
 STORE = Storage()
 
 # =========================
-# Cliente HTTP
+# HTTP client
 # =========================
 def client() -> httpx.AsyncClient:
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/json"}
     return httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=10.0), headers=headers, follow_redirects=True)
 
 # =========================
-# Utilidades
+# Utils
 # =========================
 def _bold_value_position(txt: str) -> str:
     return re.sub(r"(Valor de posición\s*=\s*\$?[0-9\.,]+)", r"💰 *\1*", txt, flags=re.IGNORECASE)
@@ -160,8 +147,7 @@ def _format_line(raw: str) -> str:
     return raw
 
 def _hash(s: str) -> str:
-    import hashlib as _hh
-    return _hh.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 # =========================
 # Extractor
@@ -445,7 +431,7 @@ async def checknow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 # =========================
-# Loop de monitoreo
+# Monitor loop
 # =========================
 async def monitor_loop(bot_app: Application):
     await asyncio.sleep(2)
@@ -524,7 +510,7 @@ async def monitor_loop(bot_app: Application):
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 # =========================
-# HTTP server
+# HTTP server (healthcheck)
 # =========================
 app_http = FastAPI()
 
@@ -551,7 +537,7 @@ async def error_handler(update: object, context: CallbackContext) -> None:
     logger.exception(f"Excepción no manejada: {err}")
 
 # =========================
-# Preinicio: limpiar webhook
+# Pre-start cleanup
 # =========================
 async def pre_start_cleanup(app: Application):
     try:
@@ -561,10 +547,10 @@ async def pre_start_cleanup(app: Application):
         logger.warning(f"No se pudo eliminar webhook (puede no existir): {e}")
 
 # =========================
-# Main (fix Py 3.13: event loop explícito)
+# Async main (Python 3.13 safe)
 # =========================
-def main():
-    # Servidor HTTP en hilo aparte
+async def async_main():
+    # Lanza el HTTP server en un hilo aparte
     threading.Thread(target=run_http_server, daemon=True).start()
 
     # Construir app de Telegram
@@ -577,22 +563,28 @@ def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_error_handler(error_handler)
 
-    # Limpiar webhook antes de iniciar
-    asyncio.run(pre_start_cleanup(app))
+    # Limpia webhook
+    await pre_start_cleanup(app)
 
-    # Lanzar monitor en segundo plano
-    threading.Thread(target=lambda: asyncio.run(monitor_loop(app)), daemon=True).start()
+    # Arranca monitor como tarea asíncrona
+    asyncio.create_task(monitor_loop(app))
 
-    logger.info("Bot iniciado (polling + HTTP healthcheck).")
+    # Secuencia recomendada por PTB (async)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
-    # --------- FIX PARA PYTHON 3.13 ----------
-    # Crear y fijar un event loop explícito para el hilo principal
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    # -----------------------------------------
+    logger.info("Bot iniciado (polling + HTTP healthcheck, async).")
 
-    # Iniciar polling
-    app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+    # Espera señales y mantiene vivo el loop
+    await app.updater.wait()  # equivalente a idle()
+
+    # Shutdown ordenado
+    await app.stop()
+    await app.shutdown()
+
+def main():
+    asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()
